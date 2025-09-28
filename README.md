@@ -1,42 +1,147 @@
-# API Monetization Gateway - .NET POC
+# Programmable API Monetization Gateway
 
-## Prerequisites
-- .NET 7 SDK
-- Docker & docker-compose
+## Overview
+This project is a **Programmable API Monetization Gateway**, designed to sit between external API consumers and internal services. The system manages **authentication, access control, usage tracking, rate limiting, and billing** for API consumers.  
 
-## Run with Docker (recommended)
-1. Build & run:
-   ```bash
-   docker-compose up --build```
-   
-2. Wait for SQL Server/Redis to be ready. The API will seed demo data and log a demo API key on startup.
-3. Call the health endpoint:
-   ```bash
-   curl -H "x-api-key: <the-seeded-key-from-logs>" http://localhost:5000/health```
-   
-## Run locally (without Docker)
-1. Set connection strings in Gateway.Api/appsettings.json.
-2. Apply migrations:
-   ```bash
-   dotnet ef database update --project Gateway.Infrastructure --startup-project Gateway.Api```
-3. Run:
-   ```bash
-   dotnet run --project Gateway.Api```
-   
-*Notes*
-
-* Rate limiting uses Redis if Redis:Connection is set; otherwise, falls back to in-memory rate limiter.
-
-* Monthly summarizer runs daily and writes summaries into MonthlySummaries table.
-
+The gateway allows SaaS platforms to monetize APIs efficiently while providing detailed usage tracking and enforcing tiered service levels.
 
 ---
 
-# Final checklist & tips
+## Table of Contents
+- [Background](#background)  
+- [Features](#features)  
+- [System Design](#system-design)  
+- [Data Model](#data-model)  
+- [Rate Limiting & Tier Enforcement](#rate-limiting--tier-enforcement)  
+- [API Usage Tracking](#api-usage-tracking)  
+- [Configuration](#configuration)  
+- [How to Run](#how-to-run)  
+- [Future Enhancements](#future-enhancements)  
 
-1. **Controllers**: Add a simple `HealthController` (shown earlier) and any test endpoints you want to protect behind the gateway.
-2. **Order of middleware**: Put `UseApiKeyAuth()` before `UseApiGateway()` and both before MVC controllers.
-3. **Secrets**: Use environment variables for DB password / redis in production.
-4. **Redis in Docker**: `Redis__Connection` should match the compose service name `redis:6379`.
-5. **Migrations in Docker**: You can auto-run migrations at startup via `DataSeeder` which calls `db.Database.MigrateAsync()`. Ensure your DB user has permission.
-6. **Testing**: Integration tests use `UseInMemoryDatabase` to avoid external dependence. For end-to-end tests against dockerized SQL+Redis use testcontainers or a CI job.
+---
+
+## Background
+Modern APIs are a core part of SaaS products. Monetizing APIs requires:  
+- Controlling access per customer and tier.  
+- Limiting usage via **rate limits** and **monthly quotas**.  
+- Tracking usage for billing and analytics.  
+
+This gateway addresses these requirements while allowing dynamic configuration of tiers and rate limits.
+
+---
+
+## Features
+- **Tier-based access:** Free, Pro, or custom tiers.  
+- **Rate limiting:** Enforces per-second limits and monthly quotas.  
+- **API usage logging:** Captures customer ID, user ID, endpoint, timestamp, response status, and latency.  
+- **Monthly summaries:** Backend job generates usage summaries and calculates billing.  
+- **Configurable tiers:** Prices, quotas, and rate limits can be updated without redeploying.  
+
+---
+
+## System Design
+### Architecture Diagram (ASCII/PlantUML style)
+
+```text
+ +----------------+      +------------------+      +--------------------+
+ | External Users | ---> |   API Gateway    | ---> | Internal Services  |
+ +----------------+      +------------------+      +--------------------+
+                              |
+                              v
+                       +-----------------+
+                       | Authentication  |
+                       +-----------------+
+                              |
+                              v
+                       +-----------------+
+                       |  Rate Limiter   |
+                       +-----------------+
+                              |
+                              v
+                       +-----------------+
+                       |  Usage Logger   |
+                       +-----------------+
+                              |
+                              v
+                       +-----------------+
+                       | Billing & Summary|
+                       +-----------------+
+                              |
+                              v
+                          +--------+
+                          | Database|
+                          +--------+
+**Components:**  
+- **API Gateway:** Intercepts requests, validates API keys, applies rate limiting.  
+- **Authentication Service:** Authenticates customers and users.  
+- **Usage Logger:** Logs every successful API request.  
+- **Rate Limiter:** Enforces tier-based limits and returns HTTP 429 on violations.  
+- **Billing & Summary Service:** Aggregates monthly usage and calculates amount due.  
+- **Database:** Stores customers, tiers, usage logs, and monthly summaries.  
+
+---
+
+## Data Model (ERD - ASCII style)
+
+```text
++------------+       +--------+       +---------------+
+|  Customer  |       |  Tier  |       |  UsageLog     |
++------------+       +--------+       +---------------+
+| Id         |<----->| Id     |       | Id            |
+| Name       |       | Name   |       | CustomerId    |
+| TierId     |       | MonthlyQuota | | UserId       |
++------------+       | RateLimitPerSecond| Endpoint |
+                     | PricePerMonth     | HttpMethod |
+                     +-----------------+ | Timestamp  |
+                                         | ResponseStatus |
+                                         | LatencyMs      |
+                                         +---------------+
+
++------------------+
+| MonthlySummary   |
++------------------+
+| Id               |
+| CustomerId       |
+| Year             |
+| Month            |
+| TotalRequests    |
+| AmountDue        |
+| GeneratedAt      |
++------------------+
+## Rate Limiting & Tier Enforcement
+- **Logic:** Requests are counted per customer. Each tier defines a **monthly quota** and a **per-second rate limit**.  
+- **Violations:** Requests exceeding the limit return **HTTP 429 Too Many Requests**.  
+- **Dynamic Configuration:** Tiers can be updated at runtime without code changes.  
+
+**Example Pseudocode:**
+```csharp
+if (customerRequestsThisSecond >= tier.RateLimitPerSecond)
+    return 429;
+
+if (customerRequestsThisMonth >= tier.MonthlyQuota)
+    return 429;
+## API Usage Tracking
+- Every successful request is logged with the following metadata:  
+  - Customer ID  
+  - Optional User ID  
+  - Endpoint  
+  - HTTP Method  
+  - Timestamp  
+  - Response Status  
+  - Latency in milliseconds  
+
+- **Monthly Summary Job:**  
+  Aggregates usage logs by customer and month, calculates total requests, and computes the amount due based on tier pricing.  
+
+---
+
+## Configuration
+- Tiers can be defined in the database or via a configuration file.  
+- Supports adding new tiers or updating limits dynamically without redeploying.  
+
+**Example Configuration:**
+```json
+[
+  { "Name": "Free", "MonthlyQuota": 100, "RateLimitPerSecond": 2, "PricePerMonth": 0 },
+  { "Name": "Pro", "MonthlyQuota": 100000, "RateLimitPerSecond": 10, "PricePerMonth": 50 }
+]
